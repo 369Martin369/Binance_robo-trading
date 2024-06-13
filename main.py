@@ -1,5 +1,6 @@
 #moved from replit to local (Anaconda/Spyder) and optimized code again
 
+import os
 import keyboard
 import winsound
 import numpy as np
@@ -12,34 +13,46 @@ import pandas_ta as ta
 import warnings
 import datetime
 from colorama import init, Fore
+from collections import deque
+from IPython import get_ipython
+import gc
+import psutil
+#import array as t  #für 60sec array
+#import requests
+#import json
+#from binance.enums import *
+#from binance.exceptions import BinanceAPIException, BinanceOrderException
+#import matplotlib.patches as mpatches
 
 
 #warnings.simplefilter(action='ignore',category=FutureWarning)  # das blendet Pandas append fehler aus
 
 #---------------------------------------------------------------------------------------------------
 api_key = "xxx"
-api_secret = "xxx"
+api_secret = "xxxx"
 #---------------------------------------------------------------------------------------------------
 
 scharf = False  #Client orders sind scharf geschalten. Für nur gucken auf False setzen!
 bought = None  #wird nun berechnet
-interval = "1s"
-Coin = "WIF"
+interval = "1h"
+Coin = "MLN"
 coinlenght = len(Coin)
 Stablecoin = "USDT"
 SYMBOL0 = Coin + Stablecoin
 SYMBOL1 = "BTC" + Stablecoin
 SYMBOL2 = Coin + "BTC"
 LIMIT = "1000"  # taking xxx candles as limit
+last_1000_profits = deque(maxlen=(60000))
 OFFCUT = 800  #kerzen Abschnitt
 Wiedereinstiegsfaktor = 0.998   # bezogen auf Niveau last Gebührendiffernez auf 0!
 PnLFaktor = Wiedereinstiegsfaktor
+Fireselloff= 22.57
 
-if interval == "1s":  Tradesec_min = 120
-elif interval == "1m":  Tradesec_min = 180
-else: Tradesec_min = 360
+if interval == "1s":  Tradesec_min = 2*60
+elif interval == "1m":  Tradesec_min = 200
+else: Tradesec_min = 6*60
 
-Stopplossmin = +0.04  # -0.04%
+Stopplossmin = +0.1  # -0.14% Startwert
 Stopplossmax = -1.0  # -1%, da sonst flashcrash war
 #---------------------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------------------
@@ -92,7 +105,7 @@ margin_aktuell_zu_slow = None
 margin_aktuell_zu_fast = None
 margin_aktuell_zu_xxl = None
 profit_since_buy_sy0 = None
-drop_since_sell_sy0 = None
+
 
 m_fast_min = None
 m_fast_max = None
@@ -106,6 +119,14 @@ SecondsSinceSell = 0
 
 client = Client(api_key, api_secret)
 
+
+# Funktion zum Löschen von Inline-Plots in Spyder
+def clear_spyder_plots():
+    ipython = get_ipython()
+    if ipython is not None:
+        ipython.run_line_magic('reset', '-f')
+        #ipython.run_line_magic('clear', '')
+
 def beep(hoehe,laenge):
     
     if (100 < hoehe > 5000): hoehe = 1000
@@ -113,6 +134,10 @@ def beep(hoehe,laenge):
     frequency = hoehe  # Set the frequency of the beep (in Hertz)
     duration = laenge    # Set the duration of the beep (in milliseconds)
     winsound.Beep(frequency, duration)
+
+def sirene():
+    winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS)
+
 
 def get_wallet_info():
     global bought
@@ -155,6 +180,8 @@ def get_my_last_trades():
     global SecondsSinceSell
     global Wiedereinstiegskurs
     global BBL
+    global Kaufzeit
+    global Sellzeit
 
     trade_record = []
     try:
@@ -196,6 +223,10 @@ def get_ticker_prices():
     global symbol0_price
     global symbol1_price
     global symbol2_price
+    global SecondsSinceBuy
+    global SecondsSinceSell
+    
+    
     #symbole = '["' + SYMBOL0 + '","' + SYMBOL1 + '","' + SYMBOL2 + '"]'
     symbole = '["' + SYMBOL0 + '","' + SYMBOL1 + '"]'
     try:
@@ -210,8 +241,28 @@ def get_ticker_prices():
     #print(symbol1_price)
     #print(symbol2_price)
     #beep(500,5)
+    
+    SecondsSinceBuy = (int(time.time()) - int(Kaufzeit / 1000))
+    SecondsSinceSell = (int(time.time()) - int(Sellzeit / 1000))
+
+    if SecondsSinceBuy > 100000000:
+        SecondsSinceBuy = SecondsSinceSell
+    else:
+        SecondsSinceSell = SecondsSinceBuy
+    
+    
     #breakpoint()
 
+
+def add_profit(profit_since_buy_sy0):
+    global profit_max
+    global Stopplossmin
+    
+    last_1000_profits.append(profit_since_buy_sy0)  # Füge den neuen Profit-Wert zur deque hinzu
+    profit_max = max(last_1000_profits)             # Berechne den maximalen Profit der letzten 1000 Werte
+    Stopplossmin=profit_max * 0.75                  # Stopplossmin update mit 75% des Maximums
+    if Stopplossmin < 0.1: Stopplossmin = 0.1       # begrenze wert auf Minimum von 0.1%
+    
 
 def get_last_two_klines():
     global symbol0_price
@@ -229,8 +280,8 @@ def get_last_two_klines():
     global margin_aktuell_zu_fast
     global margin_aktuell_zu_xxl
     global profit_since_buy_sy0
-    global drop_since_sell_sy0
     global df
+
     
     try:  #lese nur letzte Kerze
         letzte_kerze = pd.DataFrame(client.get_klines(symbol=SYMBOL0, interval=interval, limit=2))
@@ -313,17 +364,22 @@ def get_last_two_klines():
     margin_aktuell_zu_slow = (((symbol0_price) / last_ema_slow) * 100) - 100
     margin_aktuell_zu_fast = (((symbol0_price) / last_ema_fast) * 100) - 100
     margin_aktuell_zu_xxl =  (((symbol0_price) / last_ema_xxl)  * 100) - 100
-
-    if last_buy_sy0 > 0:
-        profit_since_buy_sy0 = (((symbol0_price / last_buy_sy0) * 100) - 100) * PnLFaktor
-    else:
-        profit_since_buy_sy0 = (((symbol0_price / last_sell_sy0) * 100) - 100) * PnLFaktor
-
-    if last_sell_sy0 > 0:
-        drop_since_sell_sy0 = -(((last_sell_sy0 / symbol0_price) - 1) * 100) * PnLFaktor
-    else:
-        drop_since_sell_sy0 = 0
-        profit_since_buy_sy0 = (((symbol0_price / last_buy_sy0) * 100) - 100) * PnLFaktor
+    
+    
+    #--------------------Profit Berechnung ----------------------
+    if bought == True:
+        if last_buy_sy0 > 0:
+            profit_since_buy_sy0 = (((symbol0_price / last_buy_sy0) * 100) - 100) * PnLFaktor
+        else:
+            profit_since_buy_sy0 = (((symbol0_price / last_sell_sy0) * 100) - 100) * PnLFaktor
+    if bought == False:
+        if last_sell_sy0 > 0:
+            profit_since_buy_sy0 = (((symbol0_price / last_sell_sy0) * 100) -100) * PnLFaktor
+        else:
+            profit_since_buy_sy0 = (((symbol0_price / last_buy_sy0) * 100) - 100) * PnLFaktor
+    
+    add_profit(profit_since_buy_sy0) #proft max berechung
+    
 
     #print (last_signal)
     #print (last_ema10)
@@ -413,7 +469,7 @@ def plot_klines():
     plt.rc('font', size=7)
 
     plt.grid(True)
-    plt.title(str(symbol0_price) + '=' + SYMBOL0 + ' ' + str(symbol1_price)[:8] +'=' + SYMBOL1 + ' ' + str(symbol2_price)[:8] + '=' + SYMBOL2)
+    plt.title(str(symbol0_price) + '=' + SYMBOL0 + ' ' + str(symbol1_price)[:8] +'=' + SYMBOL1)
     plt.xlabel(str(int(LIMIT) - OFFCUT) + " klines" + ' a ' + interval)
     #plt.ylabel('price', fontsize=10)
     
@@ -487,8 +543,11 @@ def plot_klines():
     
     # Abbildung direkt speichern und schließen
     #plt.savefig('c:\data\mega\martin@soos.com\martin_synch\electronics\python\output.png', dpi=300)
+    plt.clf()
+    plt.cla()    
+    clear_spyder_plots()
+    gc.collect()
     plt.close('all')  # Schließe alle Abbildungen, um Speicher freizugeben
-
 
 def write_record():
     global filezeit
@@ -511,6 +570,9 @@ def write_record():
             str(round(margin_aktuell_zu_slow, 2)) + "%" + " Mfast " +
             str(round(margin_aktuell_zu_fast, 2))) + "%" + "\n")
 
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
 
 def printout_console():
 
@@ -527,6 +589,7 @@ def printout_console():
     global stopplossfree
     global scharf
     global BBL
+    global profit_max
 
     #clear()  #clear console
     
@@ -534,8 +597,7 @@ def printout_console():
     print(">>---------- MEZ", Uhrzeit.strftime('%H:%M:%S'), "-------------")
     print(Fore.CYAN + "--------------Walletstand--------------")
     print(" ", Coin, "  free:", Coin_free, Coin, "locked:", Coin_locked)
-    print(" ", Stablecoin, " free:", Stablecoin_free, Stablecoin, "locked:",
-          Stablecoin_locked)
+    print(" ", Stablecoin, " free:", Stablecoin_free, Stablecoin, "locked:",   Stablecoin_locked)
     print("---------------------------------------", Fore.RESET)
 
     #--------------------------Kennzahlen Anzeige
@@ -554,9 +616,10 @@ def printout_console():
     if Coin == "OM":  maxbuy = int(maxbuy)
     if Coin == "WIF": maxbuy = float(int(float((Stablecoin_free / symbol0_price) * 0.999) * 100) / 100)
 
-    print(SYMBOL0[:coinlenght], "=", symbol0_price, SYMBOL0[coinlenght:8],
-          "; maxbuy ~", maxbuy, SYMBOL0[:coinlenght])
-    print("Profit/loss:{:>7.4f}".format(profit_since_buy_sy0), "%")
+    print(SYMBOL0[:coinlenght], "=", symbol0_price, SYMBOL0[coinlenght:8], "; maxbuy ~", maxbuy, SYMBOL0[:coinlenght])
+    print("P&L:{:>6.4f}% P&L_max:{:>6.4f}% Δ:{:>3.1f}%".format(profit_since_buy_sy0, profit_max, ((100/profit_since_buy_sy0*profit_max)-100)))
+
+
     print("---------------------------------------")
 
     if scharf:
@@ -680,27 +743,15 @@ def printout_console():
 
     #--------------------------Stopploss Anzeige
 
-    print(Fore.YELLOW + "------", SYMBOL0[:coinlenght],
-          "Stopploss-Bedingungen ------", Fore.RESET)
-    ausdruck = "1.) Loss?  {:>9.4f}  < {:>8.4f} {:<6}".format(
-        profit_since_buy_sy0, Stopplossmin, Fore.GREEN + "true" +
-        Fore.RESET if profit_since_buy_sy0 < Stopplossmin else Fore.RED +
-        "false" + Fore.RESET)
+    print(Fore.YELLOW + "------", SYMBOL0[:coinlenght], "Stopploss-Bedingungen ------", Fore.RESET)
+    
+    ausdruck = "1.) Loss?  {:>9.4f}  < {:>8.4f} {:<6}".format(profit_since_buy_sy0, Stopplossmin, Fore.GREEN + "true" + Fore.RESET if profit_since_buy_sy0 < Stopplossmin else Fore.RED +"false" + Fore.RESET)
     print(ausdruck)
-    ausdruck = "2.) no dip?  {:>7.4f}  > {:>8.4f} {:<6}".format(
-        profit_since_buy_sy0, Stopplossmax, Fore.GREEN + "true" +
-        Fore.RESET if profit_since_buy_sy0 > Stopplossmax else Fore.RED +
-        "false" + Fore.RESET)
+    
+    ausdruck = "2.) no dip?  {:>7.4f}  > {:>8.4f} {:<6}".format(profit_since_buy_sy0, Stopplossmax, Fore.GREEN + "true" +Fore.RESET if profit_since_buy_sy0 > Stopplossmax else Fore.RED +"false" + Fore.RESET)
     print(ausdruck)
-    ausdruck = "3.) XXL-EMA{:>9.4f}  < {:>8.4f} {:<6}".format(
-        round(symbol0_price, 4), round(last_ema_xxl, 4), Fore.GREEN + "true" +
-        Fore.RESET if symbol0_price < last_ema_xxl else Fore.RED + "false" +
-        Fore.RESET)
-    print(ausdruck)
-    ausdruck = "4.) EMA-fast{:>8.4f}  < {:>8.4f} {:<6}".format(
-        round(symbol0_price, 4), round(last_ema_fast, 4), Fore.GREEN + "true" +
-        Fore.RESET if symbol0_price < last_ema_fast else Fore.RED + "false" +
-        Fore.RESET)
+    
+    ausdruck = "3.) EMA-fast{:>8.4f}  < {:>8.4f} {:<6}".format(round(symbol0_price, 4), round(last_ema_fast, 4), Fore.GREEN + "true" + Fore.RESET if symbol0_price < last_ema_fast else Fore.RED + "false" + Fore.RESET)
     print(ausdruck)
 
     is_true = (Tradesec_min < SecondsSinceSell < 86400)
@@ -710,9 +761,7 @@ def printout_console():
         SecondsSinceSell, " >" if is_true else " <", Tradesec_min, status)
     print(ausdruck)
 
-    ausdruck = "6.) Stoppfree{:>7.1f}  > {:>8.1f} {:<6}".format(
-        stopplossfree, 10, Fore.GREEN + "true" + Fore.RESET if
-        (stopplossfree > 10) else Fore.RED + "false" + Fore.RESET)
+    ausdruck = "6.) Stoppfree{:>7.1f}  > {:>8.1f} {:<6}".format(stopplossfree, 10, Fore.GREEN + "true" + Fore.RESET if (stopplossfree > 10) else Fore.RED + "false" + Fore.RESET)
     print(ausdruck)
     print(Fore.YELLOW + "---------------------------------------" + Fore.RESET)
 
@@ -740,8 +789,6 @@ def printout_console():
 
 
 def buy_sell_level_adoption():  # anpassung der startwerte wenn zyklus durchlaufen
-    global margin_min
-    global margin_max
     global margin_diff
     global buy_level_xxl
     global buy_level_slow
@@ -749,17 +796,14 @@ def buy_sell_level_adoption():  # anpassung der startwerte wenn zyklus durchlauf
     global sell_level_xxl
     global sell_level_slow
     global sell_level_fast
-    global margin_aktuell_zu_slow
-    global margin_aktuell_zu_fast
-    global margin_aktuell_zu_xxl
-    global interval
-
     global m_fast_min
     global m_fast_max
     global m_slow_min
     global m_slow_max
     global m_xxl_min
     global m_xxl_max
+    #global margin_aktuell_zu_slow    #global margin_aktuell_zu_fast    #global margin_aktuell_zu_xxl    #global interval    #global margin_min    #global margin_max
+
 
     #last_rows = data.tail((int(LIMIT)-int(OFFCUT+300)))
     last_rows = data.tail(120)
@@ -824,11 +868,35 @@ def Stopploss():
     
     if bought \
         and (Stopplossmax < profit_since_buy_sy0 < Stopplossmin) \
-        and symbol0_price < last_ema_xxl \
         and symbol0_price < last_ema_fast \
         and stopplossfree > 10.0 \
         and Tradesec_min < SecondsSinceBuy < 86400:  #wenn 2min und 1Tag, aber Verlust darf nicht größer 1% sein (flashcrash) #profit und alle EMA zeigen nach unten und 40sec sind vergangen? Fire-sell!!
+        #and symbol0_price < last_ema_xxl \
         print("Stopplossverkauf wenn scharf von", Coin, "zu Preis", symbol0_price, "mit Menge:", QNTY)
+        Sofortverkaufen()
+        
+def Firesell():
+    global QNTY
+    global Coin_free
+    global stopplossfree
+    global symbol0_price
+    global Coin
+    global scharf
+    
+    QNTY = float(int(float(Coin_free * 1000)) / 1000); stopplossfree = QNTY * symbol0_price
+    
+    if Coin == "OM":  QNTY = int(float(int(float(Coin_free * 1000)) / 1000))
+    if Coin == "WIF": QNTY = float(int(float(Coin_free  * 100)) / 100)
+    if Coin == "MLN": QNTY = float(int(float(Coin_free  * 100)) / 100)
+    
+    if bought \
+        and Fireselloff > 0 \
+        and Coin == "MLN" \
+        and symbol0_price >= Fireselloff \
+        and stopplossfree > 10.0 \
+        and Tradesec_min < SecondsSinceBuy < 86400:  #wenn 2min und 1Tag, aber Verlust darf nicht größer 1% sein (flashcrash) #profit und alle EMA zeigen nach unten und 40sec sind vergangen? Fire-sell!!
+        
+        print("Gewinnverkauf wenn scharf von", Coin, "zu Preis", symbol0_price, "mit Menge:", QNTY)
         Sofortverkaufen()
 
 
@@ -857,7 +925,6 @@ def verkaufen():
         and profit_since_buy_sy0 > sell_level_slow: 
         Sofortverkaufen()
             
-        
 
 def Sofortverkaufen():
     global Stablecoin_free
@@ -868,6 +935,7 @@ def Sofortverkaufen():
     global sell_level_xxl
     global BBL
     global last_sell_sy0
+    global profit_max
     
     QNTY = float(int(float(Coin_free * 1000)) / 1000)
     if Coin == "OM" : QNTY = int(float(int(float(Coin_free * 1000)) / 1000))
@@ -889,6 +957,7 @@ def Sofortverkaufen():
                 Wiedereinstiegskurs = last_sell_sy0 * Wiedereinstiegsfaktor
                 sell_level_xxl = margin_max
                 buy_level_xxl = margin_min
+                profit_max=0
                 
                 get_my_last_trades()
                 get_wallet_info()
@@ -897,12 +966,12 @@ def Sofortverkaufen():
             except:
                 print("Wir haben nicht verkauft. Am Konto sind immer noch:", Stablecoin_free, + Stablecoin)
                 bought = False
-        
                 last_sell_sy0 = symbol0_price  #stark vereinfacht
                 Wiedereinstiegskurs = last_sell_sy0 * Wiedereinstiegsfaktor
-        
                 sell_level_xxl = margin_max
                 buy_level_xxl = margin_min
+
+    get_my_last_trades()
     
     
 def Sofortkaufen():
@@ -927,6 +996,7 @@ def Sofortkaufen():
     global sell_level_xxl
     global SecondsSinceBuy
     global SecondsSinceSell
+    global profit_max
 
     
     QNTY = int((float(int(float(Stablecoin_free / symbol0_price) * 1000)) / 1000) * 0.998)
@@ -949,9 +1019,10 @@ def Sofortkaufen():
                 last_buy_sy0 = symbol0_price  #stark vereinfacht
                 sell_level_xxl = margin_max
                 buy_level_slow = margin_min
-                write_record()
+                profit_max=0
                 get_my_last_trades()
                 get_wallet_info()
+                write_record()
     
             except:
                 print("Wir haben nicht gekauft. Am Konto sind immer noch:", Coin_free, Coin, "und", Stablecoin_free, + Stablecoin)
@@ -959,6 +1030,22 @@ def Sofortkaufen():
                 last_buy_sy0 = symbol0_price  #stark vereinfacht
                 sell_level_xxl = margin_max
                 buy_level_slow = margin_min
+
+# Funktion zum Neustarten des Kernels
+def restart_kernel():
+    ipython = get_ipython()
+    if ipython is not None:
+        print("Kernel wird neu gestartet...")
+        ipython.run_line_magic('reset', '-f')
+        ipython.kernel.do_shutdown(restart=True)
+        gc.collect()
+
+# Funktion zur Überwachung des Speicherverbrauchs
+def check_memory_usage(threshold=0.8):
+    memory_info = psutil.virtual_memory()
+    usage_percent = memory_info.percent
+    print(f"Speichernutzung: {usage_percent}%")
+    return usage_percent > threshold
 
 def main():
     
@@ -976,6 +1063,7 @@ def main():
     global refreshzeit
     global filezeit
     global scharf
+    global zwischenspeicher
 
     print("started running at", time.strftime('%Y-%m-%d %H:%M:%S %Z'))
     startzeit = time.time()
@@ -988,6 +1076,7 @@ def main():
     plot_klines()
     get_my_last_trades()
     #breakpoint()
+    plotzeit = time.time()
 
     while True:
         try:
@@ -998,13 +1087,27 @@ def main():
             kaufen()  # prüfen ob gekauft werden soll
             verkaufen()  # prüfen ob verkauft werden soll
             printout_console()
-            plot_klines()
+            
+            
+            if (time.time() >= plotzeit + 5):  # jede Minute
+                plot_klines()    
+                plotzeit = time.time()
             
             if (time.time() >= refreshzeit + 60):  # jede Minute
                 try:
                     refreshzeit = time.time()
                     get_my_last_trades()
                     get_wallet_info()
+                    # Überprüfe den Speicherverbrauch und starte ggf. den Kernel neu
+                    #if check_memory_usage(threshold=80):  # Wenn die Speichernutzung 80% überschreitet
+                    #    beep(1000,10)
+                        
+                    # Überprüfe und beende speicherintensive Prozesse
+                    #for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                    #    if proc.info['memory_percent'] > 40:  # Beispiel: Prozesse mit mehr als 10% Speicherverbrauch
+                    #        print(f"Beende Prozess {proc.info['name']} (PID: {proc.info['pid']}) mit {proc.info['memory_percent']}% Speicherverbrauch")
+                    #        psutil.Process(proc.info['pid']).terminate()
+                    
                 except:
                     pass
             
